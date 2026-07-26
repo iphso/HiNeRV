@@ -309,6 +309,27 @@ def main():
                 best_metrics.update('full', num_params['All'], metrics)
                 checkpoint_manager.save(epoch, metrics)
 
+            # Unconditional raw weights save, independent of the eval cadence above, so a
+            # wall-clock-terminated run (e.g. --eval-epochs set high to skip in-loop eval
+            # entirely) still leaves a checkpoint of the latest trained weights to eval standalone.
+            # Saved to a tmp dir then atomically swapped in, so an external wall-clock monitor
+            # copying checkpoint_latest at an arbitrary moment never sees a half-written directory
+            # (accelerator.save_state writes several files non-atomically).
+            if accelerator.is_main_process:
+                latest_dir = os.path.join(output_dir, 'checkpoints', 'checkpoint_latest')
+                tmp_dir = latest_dir + '_tmp'
+                if os.path.isdir(tmp_dir):
+                    shutil.rmtree(tmp_dir)
+                accelerator.save_state(output_dir=tmp_dir)
+                # CheckpointManager.load() (used by --eval-only --resume) reads meta.yml for the
+                # epoch number after loading accelerator state -- write it here too, since this
+                # unconditional save bypasses CheckpointManager.save() entirely.
+                with open(os.path.join(tmp_dir, 'meta.yml'), 'w') as f:
+                    yaml.dump({'epoch': epoch}, f)
+                if os.path.isdir(latest_dir):
+                    shutil.rmtree(latest_dir)
+                os.replace(tmp_dir, latest_dir)
+
             epoch += 1
 
 
@@ -389,7 +410,13 @@ def main():
 
     else:
         # Evaluation
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
         _, metrics = eval_step(args, logger, None, epoch, model, eval_loader, eval_task, accelerator, True)
+        if torch.cuda.is_available():
+            peak_mem = torch.cuda.max_memory_allocated() / (1024**2)
+            logger.info(f'Decode Peak Mem (MiB): {peak_mem:.1f}')
 
 
 if __name__ == '__main__':

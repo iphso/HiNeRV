@@ -1,0 +1,19 @@
+services:
+  backend:
+    build:
+      context: .
+    container_name: hinerv
+    ports:
+      - "6007:6006"
+    volumes:
+      - .:/app
+      - /root/datasets/bigbuckbunny/frames:/app/data/bunny:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
