@@ -3,6 +3,7 @@ HiNeRV Training Script
 """
 
 from utils import *
+import nb_hook
 from datasets import create_dataset, create_loader, set_dataset_args
 from hinerv_tasks import VideoRegressionTask, set_task_args
 from hinerv_compress import *
@@ -94,6 +95,7 @@ def train_step(args, logger, suffix, epoch, model, loader, optimizer, scheduler,
     optimizer.zero_grad()
 
     for i, batch in enumerate(loader):
+        nb_hook.poll(lambda: accelerator.unwrap_model(model).state_dict(), epoch)
         # Train step
         with accelerator.accumulate(model):
             inputs, _, outputs, loss, metrics = task.step(model, loader, batch)
@@ -201,6 +203,7 @@ def main():
 
     # Set & store args
     args = parse_args(parser)
+    nb_hook.install()
 
     # Set accelerator, logger, output dir
     accelerator, logger, output_dir = get_accelerator_logger(args)
@@ -283,6 +286,22 @@ def main():
         logger.info(f'Bits Per Pixel (BPP): {bits_per_pixel:.4f}')
 
 
+    nb_hook.count_exit(num_params['All'])
+    if nb_hook.EVAL_DIR:
+        # wall-clock bench eval: full-frame decode through the eval task's own input/output plumbing
+        def decode(idx):
+            t = idx.long()
+            inputs = {'x': None, 'idx': torch.stack([t, torch.zeros_like(t), torch.zeros_like(t)], dim=1),
+                      'idx_max': eval_dataset.num_patches, 'batch_size': len(t),
+                      'video_size': eval_dataset.video_size, 'patch_size': eval_dataset.patch_size}
+            with accelerator.autocast():
+                out = eval_task.parse_output(eval_loader, model(inputs))   # [N, C, T=1, H, W]
+            return out[:, :, 0].float()
+        nb_hook.evaluate(model, decode, frame_dir=os.path.join(args.dataset, args.dataset_name),
+                         device=accelerator.device, load=lambda sd: accelerator.unwrap_model(model).load_state_dict(sd),
+                         n_params=num_params['All'])
+        return
+
     if not args.eval_only:
         # Start training
         logger.info(f'Start training for {args.epochs + args.prune_epochs + args.quant_epochs} epochs.')
@@ -302,8 +321,10 @@ def main():
             # Training
             train_step(args, logger, '', epoch, model, train_loader, opt_sch[0], opt_sch[1], train_task, accelerator, False)
 
-            # Evaluation
-            if do_eval(args, epoch, args.epochs):
+            nb_hook.epoch_end(epoch + 1, train_dataset.video_size[0])
+
+            # Evaluation (skipped in the wall-clock bench: it is evaluated offline from snapshots)
+            if do_eval(args, epoch, args.epochs) and not nb_hook.ACTIVE:
                 _, metrics = eval_step(args, logger, '', epoch, model, eval_loader, eval_task, accelerator,
                                        do_log(args, epoch, args.epochs))
                 best_metrics.update('full', num_params['All'], metrics)
@@ -311,6 +332,9 @@ def main():
 
             epoch += 1
 
+        if nb_hook.ACTIVE:
+            nb_hook.final(lambda: accelerator.unwrap_model(model).state_dict(), epoch)
+            return
 
         # Pruning fine-tuning loop
         if epoch < args.epochs + args.prune_epochs:
